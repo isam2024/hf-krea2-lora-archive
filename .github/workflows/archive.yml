@@ -1,0 +1,69 @@
+name: Archive LoRAs (HF -> HF)
+
+# Mirrors the source HF repos listed in repos.txt to the destination account.
+# GitHub's runners do all the bandwidth; nothing touches your local machine.
+# Idempotent: re-running only copies repos that are missing/incomplete.
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_shards:
+        description: "Number of shards to split the list into"
+        required: true
+        default: "6"
+      private:
+        description: "Create destination repos private?"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  build-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      - id: gen
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          n = int("${{ github.event.inputs.num_shards }}")
+          print("shards=" + json.dumps(list(range(n))))
+          PY
+
+  copy:
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      # Account-wide HF limit is ~1000 API req / 300s; ~3 concurrent uploaders
+      # saturates it. More just causes 429 backoff churn without more throughput.
+      max-parallel: 3
+      matrix:
+        shard: ${{ fromJson(needs.build-matrix.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet "huggingface_hub>=0.25" hf_transfer
+
+      - name: Free up disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h /
+
+      - name: Copy shard
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DEST_USER: ${{ vars.DEST_USER }}
+          SHARD: ${{ matrix.shard }}
+          NUM_SHARDS: ${{ github.event.inputs.num_shards }}
+          PRIVATE: ${{ github.event.inputs.private }}
+        run: python mirror.py
