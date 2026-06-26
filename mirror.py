@@ -104,13 +104,26 @@ def dest_id_for(src_id: str) -> str:
     return f"{DEST_USER}/{src_id.split('/')[-1]}"
 
 
-def already_complete(src_id: str, dest_id: str) -> bool:
-    """True if the destination repo exists and contains every source file.
+def fetch_existing_dest_names() -> set:
+    """One paginated API call: the set of model names already on the dest account.
 
-    Checks the destination first (one call); only lists the source for
-    comparison when the destination already exists — saves API budget on the
-    common first-pass case where the destination is missing entirely.
-    """
+    Lets us cheaply tell 'definitely not copied yet' (skip both list calls and
+    go straight to download) from 'exists, must compare files'. This is the big
+    rate-limit saver: not-yet-copied repos cost 0 metadata calls here."""
+    try:
+        models = with_retry("list-dest-account", api.list_models, author=DEST_USER)
+        return {m.id.split("/")[-1] for m in models}
+    except Exception as e:
+        print(f"  WARN could not pre-list dest account ({e!r}); "
+              f"falling back to per-repo checks", flush=True)
+        return None  # signal: fall back to per-repo existence check
+
+
+def already_complete(src_id: str, dest_id: str, existing_names) -> bool:
+    """True if the destination repo exists and contains every source file."""
+    name = dest_id.split("/")[-1]
+    if existing_names is not None and name not in existing_names:
+        return False  # not on dest yet -> copy, no metadata calls spent
     try:
         dest_files = set(with_retry("list-dest", api.list_repo_files,
                                     dest_id, repo_type="model", token=HF_TOKEN))
@@ -124,9 +137,9 @@ def already_complete(src_id: str, dest_id: str) -> bool:
     return src_files.issubset(dest_files)
 
 
-def copy_one(src_id: str) -> str:
+def copy_one(src_id: str, existing_names) -> str:
     dest_id = dest_id_for(src_id)
-    if already_complete(src_id, dest_id):
+    if already_complete(src_id, dest_id, existing_names):
         return "skip"
 
     tmp = tempfile.mkdtemp(prefix="hfcopy_")
@@ -150,15 +163,17 @@ def main() -> int:
         repos = [ln.strip() for ln in f if ln.strip()]
 
     mine = [r for i, r in enumerate(repos) if i % NUM_SHARDS == SHARD]
+    existing_names = fetch_existing_dest_names()
     print(f"[shard {SHARD}/{NUM_SHARDS}] {len(mine)} repos to process "
-          f"(of {len(repos)} total) -> {DEST_USER} (private={PRIVATE})",
+          f"(of {len(repos)} total) -> {DEST_USER} (private={PRIVATE}); "
+          f"dest already has {len(existing_names) if existing_names is not None else '?'} repos",
           flush=True)
 
     copied = skipped = 0
     failed = []
     for n, src_id in enumerate(mine, 1):
         try:
-            result = copy_one(src_id)
+            result = copy_one(src_id, existing_names)
             if result == "skip":
                 skipped += 1
                 print(f"[{n}/{len(mine)}] SKIP  {src_id} (already complete)", flush=True)

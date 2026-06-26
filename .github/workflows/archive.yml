@@ -39,9 +39,10 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      # Account-wide HF limit is ~1000 API req / 300s; ~3 concurrent uploaders
-      # saturates it. More just causes 429 backoff churn without more throughput.
-      max-parallel: 3
+      # Account-wide HF limit is ~1000 API req / 300s. In steady state each
+      # uploader needs ~600 req/5min, so 2 concurrent stays under the cap; 3+
+      # saturates it and thrashes on 429 backoff. Keep this at 2.
+      max-parallel: 2
       matrix:
         shard: ${{ fromJson(needs.build-matrix.outputs.shards) }}
     steps:
