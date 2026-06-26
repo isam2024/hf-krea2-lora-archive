@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""Copy a shard of HF model repos from a source account to a destination account.
+"""Archive many source HF model repos into ONE destination repo as subfolders.
 
-Runs on a GitHub Actions runner. For each repo in this shard it:
-  1. Checks the destination — if the mirror already has every source file, skips.
-  2. Otherwise downloads the source repo to a temp dir, creates the dest repo,
-     and uploads the folder. The temp dir is deleted after each repo so disk
-     never fills (one ~235 MB repo at a time).
+Runs on a GitHub Actions runner. Each source repo `ilkerzgi/<name>` is copied
+into `ARCHIVE_REPO` under a subfolder `<name>/...` (full contents: weights,
+README, preview images). Downloads are batched so several LoRAs go up in a
+single commit — far fewer Hub-API calls than one-commit-per-LoRA.
 
-Idempotent and resumable: re-running only touches repos that are missing or
-incomplete on the destination.
+Idempotent and resumable: a LoRA whose subfolder already exists in the archive
+is skipped, so re-running only adds what's missing.
 
-Rate-limit aware: HF enforces ~1000 API requests per 300s window, account-wide.
-Every HF call is wrapped in `with_retry`, which on a 429 sleeps the server's
-`Retry-After` (the full window, ~240s) and retries. Combined with low shard
-parallelism this self-throttles to stay under the cap instead of failing.
+Because all commits target the SAME repo, shards MUST run sequentially
+(workflow sets max-parallel: 1) to avoid concurrent-commit conflicts. Sharding
+still helps by giving per-job checkpoints under the 6h job timeout.
 
 Env vars:
-  HF_TOKEN     token with read+write (read source, write destination) (required)
-  DEST_USER    destination namespace, e.g. k2styles (required)
+  HF_TOKEN     token with read+write (required)
+  ARCHIVE_REPO destination repo id, e.g. k2styles/krea-2-style-loras-archive (required)
   SHARD        this runner's shard index, 0-based (default 0)
   NUM_SHARDS   total number of shards (default 1)
-  PRIVATE      "true" to create dest repos private (default false)
-  REPOS_FILE   path to newline-separated source repo ids (default repos.txt)
-  BASE_DELAY   seconds to pause between repos to smooth bursts (default 1.5)
+  REPOS_FILE   newline-separated source repo ids (default repos.txt)
+  BATCH_SIZE   LoRAs to bundle into one commit (default 12)
+  SKIP_REPOS   comma-separated source ids to skip entirely (e.g. the index repo)
 """
 import os
 import sys
@@ -32,11 +30,7 @@ import time
 import traceback
 
 from huggingface_hub import HfApi, snapshot_download
-from huggingface_hub.utils import (
-    RepositoryNotFoundError,
-    GatedRepoError,
-    HfHubHTTPError,
-)
+from huggingface_hub.utils import HfHubHTTPError
 
 try:
     import httpx
@@ -44,22 +38,21 @@ try:
 except Exception:  # pragma: no cover
     HTTPX_ERR = tuple()
 
-HF_TOKEN   = os.environ["HF_TOKEN"]
-DEST_USER  = os.environ["DEST_USER"]
-SHARD      = int(os.environ.get("SHARD", "0"))
-NUM_SHARDS = int(os.environ.get("NUM_SHARDS", "1"))
-PRIVATE    = os.environ.get("PRIVATE", "false").lower() == "true"
-REPOS_FILE = os.environ.get("REPOS_FILE", "repos.txt")
-BASE_DELAY = float(os.environ.get("BASE_DELAY", "1.5"))
+HF_TOKEN     = os.environ["HF_TOKEN"]
+ARCHIVE_REPO = os.environ["ARCHIVE_REPO"]
+SHARD        = int(os.environ.get("SHARD", "0"))
+NUM_SHARDS   = int(os.environ.get("NUM_SHARDS", "1"))
+REPOS_FILE   = os.environ.get("REPOS_FILE", "repos.txt")
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", "12"))
+SKIP_REPOS   = {s.strip() for s in os.environ.get("SKIP_REPOS", "").split(",") if s.strip()}
 
-MAX_RETRIES = 12          # generous: a 429 window is ~240s, we may wait several
-MAX_SLEEP   = 320         # cap on any single backoff sleep
+MAX_RETRIES = 12
+MAX_SLEEP   = 320
 
 api = HfApi(token=HF_TOKEN)
 
 
 def _status_and_retry_after(exc):
-    """Extract (http_status, retry_after_seconds) from an HF/httpx error, if any."""
     resp = getattr(exc, "response", None)
     status = getattr(resp, "status_code", None)
     retry_after = None
@@ -70,14 +63,11 @@ def _status_and_retry_after(exc):
                 retry_after = int(ra)
         except Exception:
             pass
-    # fall back to parsing the message ("Retry after 232 seconds")
-    if retry_after is None:
-        msg = str(exc)
-        if "Retry after" in msg:
-            try:
-                retry_after = int(msg.split("Retry after")[1].split("second")[0].strip())
-            except Exception:
-                pass
+    if retry_after is None and "Retry after" in str(exc):
+        try:
+            retry_after = int(str(exc).split("Retry after")[1].split("second")[0].strip())
+        except Exception:
+            pass
     return status, retry_after
 
 
@@ -93,109 +83,84 @@ def with_retry(label, fn, *args, **kwargs):
             if not transient or attempt == MAX_RETRIES:
                 raise
             wait = retry_after if retry_after is not None else min(MAX_SLEEP, 20 * attempt)
-            wait = min(wait + 5, MAX_SLEEP)  # small cushion past the stated window
+            wait = min(wait + 5, MAX_SLEEP)
             print(f"    [{label}] {status or '429'} — sleeping {wait}s "
                   f"(attempt {attempt}/{MAX_RETRIES})", flush=True)
             time.sleep(wait)
     raise RuntimeError(f"{label}: retries exhausted")
 
 
-def dest_id_for(src_id: str) -> str:
-    return f"{DEST_USER}/{src_id.split('/')[-1]}"
+def subfolder_for(src_id: str) -> str:
+    return src_id.split("/")[-1]
 
 
-def fetch_existing_dest_names() -> set:
-    """One paginated API call: the set of model names already on the dest account.
-
-    Lets us cheaply tell 'definitely not copied yet' (skip both list calls and
-    go straight to download) from 'exists, must compare files'. This is the big
-    rate-limit saver: not-yet-copied repos cost 0 metadata calls here."""
+def done_subfolders() -> set:
+    """Top-level subfolders already present in the archive repo."""
     try:
-        models = with_retry("list-dest-account", api.list_models, author=DEST_USER)
-        return {m.id.split("/")[-1] for m in models}
+        files = with_retry("list-archive", api.list_repo_files,
+                           ARCHIVE_REPO, repo_type="model", token=HF_TOKEN)
     except Exception as e:
-        print(f"  WARN could not pre-list dest account ({e!r}); "
-              f"falling back to per-repo checks", flush=True)
-        return None  # signal: fall back to per-repo existence check
+        print(f"  WARN could not list archive ({e!r}); assuming empty", flush=True)
+        return set()
+    return {f.split("/")[0] for f in files if "/" in f}
 
 
-def already_complete(src_id: str, dest_id: str, existing_names) -> bool:
-    """True if the destination repo exists and contains every source file."""
-    name = dest_id.split("/")[-1]
-    if existing_names is not None and name not in existing_names:
-        return False  # not on dest yet -> copy, no metadata calls spent
+def process_batch(batch):
+    """Download each LoRA in `batch` into staging/<subfolder>/, then upload the
+    whole staging dir to the archive in a single commit."""
+    staging = tempfile.mkdtemp(prefix="hfbatch_")
     try:
-        dest_files = set(with_retry("list-dest", api.list_repo_files,
-                                    dest_id, repo_type="model", token=HF_TOKEN))
-    except RepositoryNotFoundError:
-        return False
-    try:
-        src_files = set(with_retry("list-src", api.list_repo_files,
-                                   src_id, repo_type="model", token=HF_TOKEN))
-    except Exception:
-        return False  # can't compare -> attempt copy
-    return src_files.issubset(dest_files)
-
-
-def copy_one(src_id: str, existing_names) -> str:
-    dest_id = dest_id_for(src_id)
-    if already_complete(src_id, dest_id, existing_names):
-        return "skip"
-
-    tmp = tempfile.mkdtemp(prefix="hfcopy_")
-    try:
-        with_retry("download", snapshot_download,
-                   repo_id=src_id, repo_type="model",
-                   local_dir=tmp, token=HF_TOKEN)
-        with_retry("create", api.create_repo,
-                   repo_id=dest_id, repo_type="model",
-                   private=PRIVATE, exist_ok=True, token=HF_TOKEN)
-        with_retry("upload", api.upload_folder,
-                   folder_path=tmp, repo_id=dest_id, repo_type="model",
-                   token=HF_TOKEN, commit_message=f"Archive mirror of {src_id}")
-        return "copied"
+        names = []
+        for src_id in batch:
+            sub = subfolder_for(src_id)
+            with_retry(f"download {sub}", snapshot_download,
+                       repo_id=src_id, repo_type="model",
+                       local_dir=os.path.join(staging, sub), token=HF_TOKEN)
+            names.append(sub)
+        with_retry("upload-batch", api.upload_folder,
+                   folder_path=staging, repo_id=ARCHIVE_REPO, repo_type="model",
+                   token=HF_TOKEN,
+                   commit_message=f"Add {len(names)} LoRAs: {', '.join(names[:6])}"
+                                  + (" …" if len(names) > 6 else ""))
+        return names
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def main() -> int:
     with open(REPOS_FILE) as f:
         repos = [ln.strip() for ln in f if ln.strip()]
 
-    mine = [r for i, r in enumerate(repos) if i % NUM_SHARDS == SHARD]
-    existing_names = fetch_existing_dest_names()
-    print(f"[shard {SHARD}/{NUM_SHARDS}] {len(mine)} repos to process "
-          f"(of {len(repos)} total) -> {DEST_USER} (private={PRIVATE}); "
-          f"dest already has {len(existing_names) if existing_names is not None else '?'} repos",
-          flush=True)
+    # this shard's slice, minus anything explicitly skipped (e.g. the index repo)
+    mine = [r for i, r in enumerate(repos)
+            if i % NUM_SHARDS == SHARD and r not in SKIP_REPOS]
 
-    copied = skipped = 0
+    done = done_subfolders()
+    todo = [r for r in mine if subfolder_for(r) not in done]
+    print(f"[shard {SHARD}/{NUM_SHARDS}] {len(mine)} in slice, "
+          f"{len(mine) - len(todo)} already in archive, {len(todo)} to add "
+          f"-> {ARCHIVE_REPO} (batch={BATCH_SIZE})", flush=True)
+
+    added = 0
     failed = []
-    for n, src_id in enumerate(mine, 1):
+    for i in range(0, len(todo), BATCH_SIZE):
+        batch = todo[i:i + BATCH_SIZE]
         try:
-            result = copy_one(src_id, existing_names)
-            if result == "skip":
-                skipped += 1
-                print(f"[{n}/{len(mine)}] SKIP  {src_id} (already complete)", flush=True)
-            else:
-                copied += 1
-                print(f"[{n}/{len(mine)}] OK    {src_id} -> {dest_id_for(src_id)}", flush=True)
-        except GatedRepoError:
-            print(f"[{n}/{len(mine)}] GATED {src_id} (cannot read) — skipping", flush=True)
-            failed.append((src_id, "gated"))
+            names = process_batch(batch)
+            added += len(names)
+            print(f"[shard {SHARD}] committed {len(names)} ({added}/{len(todo)}): "
+                  f"{', '.join(names)}", flush=True)
         except Exception as e:
-            print(f"[{n}/{len(mine)}] FAIL  {src_id}: {type(e).__name__}: {e}", flush=True)
+            print(f"[shard {SHARD}] BATCH FAIL {[subfolder_for(b) for b in batch]}: "
+                  f"{type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
-            failed.append((src_id, repr(e)))
-        if BASE_DELAY:
-            time.sleep(BASE_DELAY)
+            failed.extend(batch)
 
-    print(f"\n[shard {SHARD}] DONE: copied={copied} skipped={skipped} failed={len(failed)}",
-          flush=True)
+    print(f"\n[shard {SHARD}] DONE: added={added} failed={len(failed)}", flush=True)
     if failed:
-        print(f"[shard {SHARD}] FAILED REPOS:", flush=True)
-        for r, why in failed:
-            print(f"  {r}\t{why}", flush=True)
+        print(f"[shard {SHARD}] FAILED:", flush=True)
+        for r in failed:
+            print(f"  {r}", flush=True)
         return 1
     return 0
 

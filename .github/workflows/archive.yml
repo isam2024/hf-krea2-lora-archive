@@ -1,20 +1,16 @@
-name: Archive LoRAs (HF -> HF)
+name: Archive LoRAs (HF -> single repo)
 
-# Mirrors the source HF repos listed in repos.txt to the destination account.
-# GitHub's runners do all the bandwidth; nothing touches your local machine.
-# Idempotent: re-running only copies repos that are missing/incomplete.
+# Copies every source repo in repos.txt into ONE destination repo (ARCHIVE_REPO)
+# as a subfolder. GitHub's runners do all the bandwidth; nothing touches your
+# local machine. Idempotent: re-running only adds LoRAs not already in the archive.
 
 on:
   workflow_dispatch:
     inputs:
       num_shards:
-        description: "Number of shards to split the list into"
+        description: "Number of shards to split the list into (run sequentially)"
         required: true
-        default: "6"
-      private:
-        description: "Create destination repos private?"
-        required: true
-        default: "false"
+        default: "4"
 
 permissions:
   contents: read
@@ -28,7 +24,7 @@ jobs:
       - id: gen
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os
+          import json
           n = int("${{ github.event.inputs.num_shards }}")
           print("shards=" + json.dumps(list(range(n))))
           PY
@@ -39,10 +35,9 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      # Account-wide HF limit is ~1000 API req / 300s. In steady state each
-      # uploader needs ~600 req/5min, so 2 concurrent stays under the cap; 3+
-      # saturates it and thrashes on 429 backoff. Keep this at 2.
-      max-parallel: 2
+      # All commits target the SAME repo, so shards must run one at a time to
+      # avoid concurrent-commit conflicts. Sharding is purely for checkpointing.
+      max-parallel: 1
       matrix:
         shard: ${{ fromJson(needs.build-matrix.outputs.shards) }}
     steps:
@@ -53,7 +48,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install --quiet "huggingface_hub>=0.25" hf_transfer
+        run: pip install --quiet "huggingface_hub>=0.25"
 
       - name: Free up disk
         run: |
@@ -63,8 +58,9 @@ jobs:
       - name: Copy shard
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          DEST_USER: ${{ vars.DEST_USER }}
+          ARCHIVE_REPO: ${{ vars.ARCHIVE_REPO }}
+          SKIP_REPOS: ${{ vars.SKIP_REPOS }}
           SHARD: ${{ matrix.shard }}
           NUM_SHARDS: ${{ github.event.inputs.num_shards }}
-          PRIVATE: ${{ github.event.inputs.private }}
+          BATCH_SIZE: "12"
         run: python mirror.py
